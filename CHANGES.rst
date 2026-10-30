@@ -13,6 +13,15 @@ Unreleased
 -   Use modern packaging metadata with ``pyproject.toml`` instead of ``setup.cfg``.
     :pr:`1793`
 -   Use ``flit_core`` instead of ``setuptools`` as build backend.
+-   Add the ``stable_reload`` option to ``Environment``. When enabled, each
+    ``render``, ``generate``, ``stream`` or async output resolves every
+    template once on first use and keeps that version for the whole output,
+    even when included templates change while the output is being generated.
+    Interleaved outputs stay independent, subsequent outputs pick up valid
+    new versions, and an invalid update of a template that was loaded
+    successfully before keeps serving the last valid version until the
+    source is fixed. Templates that have never loaded successfully still
+    raise the loader error as before.
 
 
 Version 3.1.6

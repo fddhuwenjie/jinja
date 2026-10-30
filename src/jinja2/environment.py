@@ -2,6 +2,7 @@
 options.
 """
 
+import contextvars
 import os
 import typing
 import typing as t
@@ -62,7 +63,99 @@ if t.TYPE_CHECKING:
     from .ext import Extension
     from .loaders import BaseLoader
 
+    # Maps a template's cache key to the version pinned for one render output.
+    _StablePins = dict[tuple["weakref.ref[BaseLoader]", str], "Template"]
+
 _env_bound = t.TypeVar("_env_bound", bound="Environment")
+_rv = t.TypeVar("_rv")
+
+#: While a render with ``stable_reload`` enabled is executing, this points at
+#: the pin map that records which template version each template name resolves
+#: to for that particular output. It is only set while a render generator is
+#: actually executing, never while it is suspended, so interleaved outputs do
+#: not see each other's pins.
+_stable_render_pins: contextvars.ContextVar[t.Optional["_StablePins"]] = (
+    contextvars.ContextVar("jinja2_stable_render_pins", default=None)
+)
+
+
+class _StableRenderIterator:
+    """Drive a synchronous render generator with a pin map active.
+
+    The pin map is set around every individual step instead of once for the
+    whole generator. That way two outputs whose generators are interleaved on
+    the same thread cannot observe each other's pins, and the pin map is
+    removed as soon as a generator finishes or is closed early.
+    """
+
+    __slots__ = ("_generator", "_pins")
+
+    def __init__(self, generator: t.Iterator[str]) -> None:
+        self._generator: t.Generator[str, t.Any, t.Any] = t.cast(
+            t.Generator[str, t.Any, t.Any], generator
+        )
+        self._pins: _StablePins = {}
+
+    def _step(self, func: t.Callable[..., _rv], *args: t.Any) -> _rv:
+        token = _stable_render_pins.set(self._pins)
+        try:
+            return func(*args)
+        finally:
+            _stable_render_pins.reset(token)
+
+    def __iter__(self) -> "_StableRenderIterator":
+        return self
+
+    def __next__(self) -> str:
+        return self._step(self._generator.__next__)
+
+    def send(self, value: t.Any) -> str:
+        return self._step(self._generator.send, value)
+
+    def throw(self, *args: t.Any) -> str:
+        return self._step(self._generator.throw, *args)
+
+    def close(self) -> None:
+        self._step(self._generator.close)
+
+
+class _StableAsyncRenderIterator:
+    """Async counterpart of :class:`_StableRenderIterator`.
+
+    Context variables are set around every ``__anext__``/``asend``/``athrow``/
+    ``aclose`` step so concurrently interleaved outputs stay isolated even on
+    Python versions where async generators share the caller's context.
+    """
+
+    __slots__ = ("_generator", "_pins")
+
+    def __init__(self, generator: t.AsyncIterator[str]) -> None:
+        self._generator: t.AsyncGenerator[str, t.Any] = t.cast(
+            t.AsyncGenerator[str, t.Any], generator
+        )
+        self._pins: _StablePins = {}
+
+    async def _step(self, func: t.Callable[..., t.Awaitable[_rv]], *args: t.Any) -> _rv:
+        token = _stable_render_pins.set(self._pins)
+        try:
+            return await func(*args)
+        finally:
+            _stable_render_pins.reset(token)
+
+    def __aiter__(self) -> "_StableAsyncRenderIterator":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._step(self._generator.__anext__)
+
+    async def asend(self, value: t.Any) -> str:
+        return await self._step(self._generator.asend, value)
+
+    async def athrow(self, *args: t.Any) -> str:
+        return await self._step(self._generator.athrow, *args)
+
+    async def aclose(self) -> None:
+        await self._step(self._generator.aclose)
 
 
 # for direct template usage we have up to ten living environments
@@ -262,6 +355,22 @@ class Environment:
         `enable_async`
             If set to true this enables async template execution which
             allows using async functions and generators.
+
+        `stable_reload`
+            If set to ``True`` every render output (``render``,
+            ``generate``, ``stream`` and their async counterparts)
+            resolves the version of each template once, the first time
+            that template is loaded during the output, and keeps using
+            that same version for every subsequent load within the same
+            output. Interleaved outputs are independent, and the next
+            output picks up valid new versions again. When an automatic
+            reload picks up a template that can no longer be compiled,
+            the last successfully loaded version keeps being served
+            until the source is valid again. A template that has never
+            been loaded successfully still raises the loader's error.
+            This has no effect when ``auto_reload`` is disabled and only
+            applies while this mode is enabled; leaving it off preserves
+            the default reloading and error behavior.
     """
 
     #: if this environment is sandboxed.  Modifying this variable won't make
@@ -316,6 +425,7 @@ class Environment:
         auto_reload: bool = True,
         bytecode_cache: t.Optional["BytecodeCache"] = None,
         enable_async: bool = False,
+        stable_reload: bool = False,
     ):
         # !!Important notice!!
         #   The constructor accepts quite a few arguments that should be
@@ -358,6 +468,7 @@ class Environment:
         self.cache = create_cache(cache_size)
         self.bytecode_cache = bytecode_cache
         self.auto_reload = auto_reload
+        self.stable_reload = stable_reload
 
         # configurable policies
         self.policies = DEFAULT_POLICIES.copy()
@@ -408,6 +519,7 @@ class Environment:
         auto_reload: bool = missing,
         bytecode_cache: t.Optional["BytecodeCache"] = missing,
         enable_async: bool = missing,
+        stable_reload: bool = missing,
     ) -> "te.Self":
         """Create a new overlay environment that shares all the data with the
         current environment except for cache and the overridden attributes.
@@ -959,22 +1071,64 @@ class Environment:
         if self.loader is None:
             raise TypeError("no loader for this environment specified")
         cache_key = (weakref.ref(self.loader), name)
-        if self.cache is not None:
-            template = self.cache.get(cache_key)
-            if template is not None and (
-                not self.auto_reload or template.is_up_to_date
-            ):
+        # While a stable render is executing, this records the template
+        # versions already resolved for that particular output. It is ``None``
+        # outside of a stable render, including when ``stable_reload`` is
+        # disabled.
+        pins = _stable_render_pins.get() if self.stable_reload else None
+
+        if pins is not None:
+            pinned = pins.get(cache_key)
+
+            if pinned is not None:
                 # template.globals is a ChainMap, modifying it will only
                 # affect the template, not the environment globals.
                 if globals:
-                    template.globals.update(globals)
+                    pinned.globals.update(globals)
 
-                return template
+                return pinned
 
-        template = self.loader.load(self, name, self.make_globals(globals))
+        # The last template successfully loaded under this key, if any. With
+        # stable reloading it doubles as the last known good version.
+        old_template = self.cache.get(cache_key) if self.cache is not None else None
+
+        if old_template is not None and (
+            not self.auto_reload or old_template.is_up_to_date
+        ):
+            if globals:
+                old_template.globals.update(globals)
+
+            if pins is not None:
+                pins[cache_key] = old_template
+
+            return old_template
+
+        try:
+            template = self.loader.load(self, name, self.make_globals(globals))
+        except TemplateSyntaxError:
+            # A template that was loaded successfully before keeps serving
+            # its last valid version while a broken update is published. The
+            # cache is intentionally left untouched, so the next independent
+            # output retries the reload and picks up a fixed source
+            # automatically. A template that has never been loaded raises as
+            # usual.
+            if not self.stable_reload or old_template is None:
+                raise
+
+            if globals:
+                old_template.globals.update(globals)
+
+            if pins is not None:
+                pins[cache_key] = old_template
+
+            return old_template
 
         if self.cache is not None:
             self.cache[cache_key] = template
+
+        if pins is not None:
+            pins[cache_key] = template
+
         return template
 
     @internalcode
@@ -1286,8 +1440,13 @@ class Template:
 
         ctx = self.new_context(dict(*args, **kwargs))
 
+        root = self.root_render_func(ctx)
+
+        if self.environment.stable_reload:
+            root = _StableRenderIterator(root)
+
         try:
-            return self.environment.concat(self.root_render_func(ctx))  # type: ignore
+            return self.environment.concat(root)  # type: ignore
         except Exception:
             self.environment.handle_exception()
 
@@ -1307,9 +1466,14 @@ class Template:
 
         ctx = self.new_context(dict(*args, **kwargs))
 
+        root: t.AsyncIterator[str] = self.root_render_func(ctx)  # type: ignore
+
+        if self.environment.stable_reload:
+            root = _StableAsyncRenderIterator(root)
+
         try:
             return self.environment.concat(  # type: ignore
-                [n async for n in self.root_render_func(ctx)]  # type: ignore
+                [n async for n in root]
             )
         except Exception:
             return self.environment.handle_exception()
@@ -1339,8 +1503,13 @@ class Template:
 
         ctx = self.new_context(dict(*args, **kwargs))
 
+        gen: t.Iterator[str] = self.root_render_func(ctx)
+
+        if self.environment.stable_reload:
+            gen = _StableRenderIterator(gen)
+
         try:
-            yield from self.root_render_func(ctx)
+            yield from gen
         except Exception:
             yield self.environment.handle_exception()
 
@@ -1357,9 +1526,14 @@ class Template:
 
         ctx = self.new_context(dict(*args, **kwargs))
 
-        try:
-            agen: t.AsyncGenerator[str, None] = self.root_render_func(ctx)  # type: ignore[assignment]
+        agen: t.AsyncGenerator[str, t.Any] = t.cast(
+            t.AsyncGenerator[str, t.Any], self.root_render_func(ctx)
+        )
 
+        if self.environment.stable_reload:
+            agen = _StableAsyncRenderIterator(agen)
+
+        try:
             async with aclosing(agen):
                 async for event in agen:
                     yield event
